@@ -1,3 +1,6 @@
+import random
+import threading
+
 import pytest
 from textarena_env.models import TextArenaAction, TextArenaMessage
 from textarena_env.server.environment import TextArenaEnvironment
@@ -116,3 +119,70 @@ def test_reset_without_seed_still_varies():
         words.add(_secret_word(env))
 
     assert len(words) > 1, "unseeded resets should not be deterministic"
+
+
+def test_seeded_reset_restores_global_rng_state():
+    """A seeded reset must leave the process-global RNG where it found it."""
+    pytest.importorskip("textarena", reason="textarena not installed")
+    env = TextArenaEnvironment(env_id="Wordle-v0", num_players=1)
+
+    random.seed(42)
+    expected = random.random()
+
+    random.seed(42)
+    env.reset(seed=1234)
+
+    assert random.random() == expected, "seeded reset leaked into the global RNG"
+
+
+def test_seeded_reset_does_not_perturb_unseeded_session():
+    """An unseeded session must get the same episode whether or not another
+    session performed a seeded reset in between."""
+    pytest.importorskip("textarena", reason="textarena not installed")
+    unseeded = TextArenaEnvironment(env_id="Wordle-v0", num_players=1)
+    seeded = TextArenaEnvironment(env_id="Wordle-v0", num_players=1)
+
+    random.seed(42)
+    unseeded.reset()
+    baseline = _secret_word(unseeded)
+
+    random.seed(42)
+    seeded.reset(seed=1234)
+    unseeded.reset()
+
+    assert _secret_word(unseeded) == baseline
+
+
+def test_concurrent_unseeded_reset_cannot_steal_a_seeded_draw(monkeypatch):
+    """Force another session to reset in the gap between TextArena seeding the
+    global RNG and drawing the episode. The seeded episode must be unaffected."""
+    pytest.importorskip("textarena", reason="textarena not installed")
+    seeded = TextArenaEnvironment(env_id="Wordle-v0", num_players=1)
+    other = TextArenaEnvironment(env_id="Wordle-v0", num_players=1)
+
+    seeded.reset(seed=1234)
+    expected = _secret_word(seeded)
+
+    window_open = threading.Event()
+    other_done = threading.Event()
+    original_seed = random.seed
+
+    def seed_then_yield(*args, **kwargs):
+        original_seed(*args, **kwargs)
+        window_open.set()
+        other_done.wait(timeout=0.5)
+
+    monkeypatch.setattr(random, "seed", seed_then_yield)
+
+    def unseeded_reset():
+        window_open.wait(timeout=5)
+        other.reset()
+        other_done.set()
+
+    thread = threading.Thread(target=unseeded_reset)
+    thread.start()
+    seeded.reset(seed=1234)
+    thread.join(timeout=5)
+
+    assert not thread.is_alive(), "the unseeded reset never completed"
+    assert _secret_word(seeded) == expected, "another session stole the seeded draw"

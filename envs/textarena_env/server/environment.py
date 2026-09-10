@@ -8,7 +8,9 @@
 
 from __future__ import annotations
 
+import random
 import sys
+import threading
 from typing import Any, Dict, Iterable, List, Optional
 from uuid import uuid4
 
@@ -37,6 +39,10 @@ except ImportError:
 _TEXTARENA_MODULE: Any | None = None
 _TEXTARENA_IMPORT_ERROR: Exception | None = None
 _NLTK_DOWNLOADED: bool = False
+
+# TextArena seeds and draws episodes from the process-global ``random`` module,
+# so one session's reset is visible to every other session in the process.
+_RNG_LOCK = threading.Lock()
 
 
 def _ensure_nltk_data() -> None:
@@ -124,7 +130,7 @@ class TextArenaEnvironment(Environment):
         # Initialize environment state - TextArena envs require reset() to be called
         # before step() can be used, as the internal state object isn't created until reset.
         # This ensures the environment is always in a valid state after construction.
-        self._ta_env.reset(num_players=self.num_players)
+        self._reset_ta_env()
 
     # ------------------------------------------------------------------
     # Environment interface
@@ -147,7 +153,7 @@ class TextArenaEnvironment(Environment):
         if hasattr(env, "full_observations"):
             env.full_observations = {}
 
-        self._ta_env.reset(num_players=self.num_players, seed=seed)
+        self._reset_ta_env(seed)
 
         for provider in self._reward_providers:
             provider.reset()
@@ -206,6 +212,24 @@ class TextArenaEnvironment(Environment):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+    def _reset_ta_env(self, seed: Optional[int] = None) -> None:
+        """Reset the wrapped game without disturbing other sessions.
+
+        TextArena implements ``reset(seed=...)`` by calling ``random.seed`` on the
+        process-global RNG and then drawing the episode from it. The lock keeps
+        seed and draw atomic across concurrent sessions; restoring the prior
+        state keeps a seeded reset from making unseeded sessions predictable.
+        """
+        with _RNG_LOCK:
+            if seed is None:
+                self._ta_env.reset(num_players=self.num_players)
+                return
+            rng_state = random.getstate()
+            try:
+                self._ta_env.reset(num_players=self.num_players, seed=seed)
+            finally:
+                random.setstate(rng_state)
+
     def _build_observation(self) -> TextArenaObservation:
         player_id, messages = self._ta_env.get_observation()
 
