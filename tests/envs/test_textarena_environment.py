@@ -186,3 +186,127 @@ def test_concurrent_unseeded_reset_cannot_steal_a_seeded_draw(monkeypatch):
 
     assert not thread.is_alive(), "the unseeded reset never completed"
     assert _secret_word(seeded) == expected, "another session stole the seeded draw"
+
+
+@pytest.fixture
+def fake_textarena(monkeypatch):
+    """Exercise the wrapper in required CI without optional TextArena/NLTK data."""
+    from types import SimpleNamespace
+
+    from textarena_env.server import environment
+
+    class Game:
+        def reset(self, num_players, seed=None):
+            random.seed(seed)
+            self.draw = random.random()
+            self.state = SimpleNamespace(turn=0, game_state={})
+
+        def step(self, message):
+            self.draw = random.random()
+            return False, {}
+
+        def get_observation(self):
+            return 0, []
+
+    monkeypatch.setattr(
+        environment, "_TEXTARENA_MODULE", SimpleNamespace(make=lambda **kw: Game())
+    )
+    rng_state = random.getstate()
+    yield lambda: TextArenaEnvironment(env_id="test", download_nltk=False)
+    random.setstate(rng_state)
+
+
+def test_seed_forwarding_without_optional_dependencies(fake_textarena):
+    env = fake_textarena()
+    before = random.getstate()
+    env.reset(seed=0)
+    assert env._ta_env.draw == random.Random(0).random()
+    assert random.getstate() == before
+
+
+def test_failed_seeded_reset_restores_rng(fake_textarena, monkeypatch):
+    env = fake_textarena()
+    before = random.getstate()
+
+    def fail(**kwargs):
+        random.seed(kwargs["seed"])
+        raise RuntimeError("reset failed")
+
+    monkeypatch.setattr(env._ta_env, "reset", fail)
+    with pytest.raises(RuntimeError, match="reset failed"):
+        env.reset(seed=1234)
+    assert random.getstate() == before
+
+
+@pytest.mark.parametrize("operation", ["reset", "step", "construct"])
+def test_seed_window_excludes_other_session_operations(
+    fake_textarena, monkeypatch, operation
+):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from textarena_env.server import environment
+
+    seeded = fake_textarena()
+    other = fake_textarena()
+    window_open = threading.Event()
+    attempted = threading.Event()
+    entered = threading.Event()
+    release = threading.Event()
+    lock = threading.Lock()
+
+    class ObservedLock:
+        def __enter__(self):
+            if window_open.is_set():
+                attempted.set()
+            lock.acquire()
+
+        def __exit__(self, *args):
+            lock.release()
+
+    original_reset = seeded._ta_env.reset
+
+    def paused_reset(**kwargs):
+        original_reset(**kwargs)
+        window_open.set()
+        assert release.wait(5), "seed window was never released"
+
+    def draw(*args, **kwargs):
+        entered.set()
+        other._ta_env.draw = random.random()
+        return False, {}
+
+    monkeypatch.setattr(environment, "_RNG_LOCK", ObservedLock())
+    monkeypatch.setattr(seeded._ta_env, "reset", paused_reset)
+    monkeypatch.setattr(
+        other._ta_env, operation if operation != "construct" else "reset", draw
+    )
+    if operation == "construct":
+        monkeypatch.setattr(
+            environment._TEXTARENA_MODULE, "make", lambda **kw: other._ta_env
+        )
+    before = random.getstate()
+    expected = random.Random()
+    expected.setstate(before)
+    expected_draw = expected.random()
+
+    def run_other():
+        if operation == "construct":
+            fake_textarena()
+        elif operation == "step":
+            other.step(TextArenaAction(message="draw"))
+        else:
+            other.reset()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(seeded.reset, seed=1234)
+        try:
+            assert window_open.wait(5)
+            second = pool.submit(run_other)
+            assert attempted.wait(1), "operation did not acquire the RNG lock"
+            assert not entered.is_set(), "operation entered the seeded RNG window"
+        finally:
+            release.set()
+        first.result(timeout=5)
+        second.result(timeout=5)
+    assert other._ta_env.draw == expected_draw
+    assert random.getstate() == expected.getstate()
