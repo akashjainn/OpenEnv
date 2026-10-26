@@ -1,8 +1,7 @@
 import random
 import threading
-from typing import Dict, List
-
 from types import SimpleNamespace
+from typing import Dict, List
 
 import pytest
 from textarena_env.models import TextArenaAction, TextArenaMessage
@@ -305,7 +304,9 @@ def fake_textarena(monkeypatch):
         def reset(self, num_players, seed=None):
             random.seed(seed)
             self.draw = random.random()
-            self.state = SimpleNamespace(turn=0, game_state={})
+            self.state = SimpleNamespace(
+                turn=0, game_state={}, done=False, game_info={}
+            )
 
         def step(self, message):
             self.draw = random.random()
